@@ -17,6 +17,7 @@
 #include "api/units/time_delta.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/time_utils.h"
 
 namespace webrtc {
 
@@ -246,9 +247,11 @@ void ExternalAudioSource::DeliverToSinks(
     const std::vector<AudioTrackSinkInterface*>& sinks,
     const int16_t* data,
     size_t samples_per_channel) const {
+  // Dada (#321): метка захвата — время подачи. По ней ChannelSend отражает в RTP-времени паузу, пока кадров не подавали.
+  const int64_t capture_ms = TimeMillis();
   for (AudioTrackSinkInterface* sink : sinks) {
     sink->OnData(data, kBitsPerSample, sample_rate_hz_, num_channels_,
-                 samples_per_channel);
+                 samples_per_channel, capture_ms);
   }
 }
 

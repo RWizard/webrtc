@@ -24,6 +24,7 @@ rtc_library("audio") {
     "audio_state.h",
     "audio_transport_impl.cc",
     "audio_transport_impl.h",
+    "capture_gap.h",
     "channel_receive.cc",
     "channel_receive.h",
     "channel_receive_frame_transformer_delegate.cc",

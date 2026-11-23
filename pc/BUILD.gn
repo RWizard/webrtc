@@ -1279,6 +1279,7 @@ rtc_library("external_audio_source") {
     "../rtc_base:checks",
     "../rtc_base:logging",
     "../rtc_base:macromagic",
+    "../rtc_base:timeutils",
     "../rtc_base/synchronization:mutex",
     "../rtc_base/task_utils:repeating_task",
     "../system_wrappers",

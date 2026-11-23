@@ -43,6 +43,7 @@
 #include "api/units/data_size.h"
 #include "api/units/time_delta.h"
 #include "api/units/timestamp.h"
+#include "audio/capture_gap.h"
 #include "audio/channel_send_frame_transformer_delegate.h"
 #include "audio/utility/audio_frame_operations.h"
 #include "call/rtp_transport_controller_send_interface.h"
@@ -283,6 +284,8 @@ class ChannelSend : public ChannelSendInterface,
   uint32_t timestamp_ RTC_GUARDED_BY(audio_thread_race_checker_) = 0;
   std::optional<int64_t> last_capture_timestamp_ms_
       RTC_GUARDED_BY(audio_thread_race_checker_);
+  // Dada (#321): пауза захвата посреди отправки отражается в RTP-времени.
+  CaptureGap capture_gap_ RTC_GUARDED_BY(audio_thread_race_checker_);
 
   RmsLevel rms_level_ RTC_GUARDED_BY(encoder_queue_checker_);
   bool input_mute_ RTC_GUARDED_BY(volume_settings_mutex_) = false;
@@ -860,6 +863,7 @@ void ChannelSend::ProcessAndEncodeAudio(
   // after sending is resumed.
   if (first_frame_.load()) {
     first_frame_.store(false);
+    capture_gap_.Reset();
     if (last_capture_timestamp_ms_ &&
         audio_frame->absolute_capture_timestamp_ms()) {
       int64_t diff_ms = *audio_frame->absolute_capture_timestamp_ms() -
@@ -874,6 +878,20 @@ void ChannelSend::ProcessAndEncodeAudio(
     }
   }
 
+  // Dada (#321): пока захват стоял (смена микрофона или формата вывода, Bluetooth, поток захвата не успел), отсчётов не было, и
+  // без поправки звук после паузы ушёл бы с отставшей меткой: приёмник растягивает речь и копит задержку, запись — с дырами.
+  // Метка прыгает на длину паузы, приёмник видит обычный пропуск (audio/capture_gap.h).
+  const int64_t gap_samples = capture_gap_.Advance(
+      audio_frame->absolute_capture_timestamp_ms(),
+      audio_frame->sample_rate_hz(), audio_frame->samples_per_channel());
+  const bool after_gap = gap_samples > 0;
+  if (after_gap) {
+    RTC_LOG(LS_INFO) << "Capture gap: RTP timestamp advanced by "
+                     << gap_samples << " samples at "
+                     << audio_frame->sample_rate_hz() << " Hz";
+    timestamp_ += static_cast<uint32_t>(gap_samples);
+  }
+
   audio_frame->timestamp_ = timestamp_;
   timestamp_ += audio_frame->samples_per_channel_;
   last_capture_timestamp_ms_ = audio_frame->absolute_capture_timestamp_ms();
@@ -882,7 +900,8 @@ void ChannelSend::ProcessAndEncodeAudio(
   // when the task is actually executed.
   Timestamp post_task_time = env_.clock().CurrentTime();
   encoder_queue_->PostTask(
-      [this, post_task_time, audio_frame = std::move(audio_frame)]() mutable {
+      [this, post_task_time, after_gap,
+       audio_frame = std::move(audio_frame)]() mutable {
         RTC_DCHECK_RUN_ON(&encoder_queue_checker_);
         if (!encoder_queue_is_active_.load()) {
           return;
@@ -910,6 +929,12 @@ void ChannelSend::ProcessAndEncodeAudio(
           }
         }
         previous_frame_muted_ = is_muted;
+
+        // Dada (#321): недобранный пакет, начатый до паузы, не уходит после неё со старой RTP-меткой и старой меткой захвата
+        // (abs-capture-time): сброс всего модуля кодирования, как в StopSend.
+        if (after_gap) {
+          audio_coding_->Reset();
+        }
 
         // This call will trigger AudioPacketizationCallback::SendData if
         // encoding is done and payload is ready for packetization and
