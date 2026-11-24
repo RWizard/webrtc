@@ -48,6 +48,7 @@
 namespace webrtc {
 
 NSString* const kAudioEngineInputMixerNodeKey = @"_audio_engine_input_mixer_node_key";
+NSString* const kAudioEngineInputStateNotification = @"RTCAudioDeviceModuleInputStateNotification";
 
 #define LOGI() RTC_LOG(LS_INFO) << "AudioEngineDevice::"
 #define LOGE() RTC_LOG(LS_ERROR) << "AudioEngineDevice::"
@@ -159,6 +160,24 @@ AudioEngineDevice::EngineState ApplyAudioProcessingOptionsToEngineState(AudioEng
   return state;
 }
 
+// Dada (#321): захват HAL на Mac Catalyst включён, пока NSUserDefaults dada.mic.hal не NO (аварийный выключатель без новой
+// сборки: defaults write <bundle id> dada.mic.hal -bool NO возвращает захват через вход AVAudioEngine).
+bool UseHalInput() {
+#if TARGET_OS_MACCATALYST
+  NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+  return [defaults objectForKey:@"dada.mic.hal"] == nil || [defaults boolForKey:@"dada.mic.hal"];
+#else
+  return false;
+#endif
+}
+
+#if TARGET_OS_MACCATALYST
+// Захват HAL идёт, пока вход включён и движок работает — как вход AVAudioEngine прежде (он писал, пока движок шёл с входом).
+bool HalShouldRun(const AudioEngineDevice::EngineState &state) {
+  return state.IsInputEnabled() && state.IsAnyRunning() && !state.is_interrupted;
+}
+#endif
+
 }  // namespace
 
 // Maps AudioDuckingLevel to AVAudioVoiceProcessingOtherAudioDuckingLevel.
@@ -182,7 +201,7 @@ AVAudioVoiceProcessingOtherAudioDuckingLevel ToAVDuckingLevel(
 #endif
 
 AudioEngineDevice::AudioEngineDevice(const Environment& env, bool voice_processing_bypassed)
-    : task_queue_factory_(CreateDefaultTaskQueueFactory()), initialized_(false) {
+    : task_queue_factory_(CreateDefaultTaskQueueFactory()), use_hal_(UseHalInput()), initialized_(false) {
   LOGI() << "voice_processing_bypassed " << voice_processing_bypassed;
 
   thread_ = webrtc::Thread::Current();
@@ -211,6 +230,33 @@ AudioEngineDevice::AudioEngineDevice(const Environment& env, bool voice_processi
   engine_state_.built_in_aec_enabled = !voice_processing_bypassed;
   engine_state_.built_in_ns_enabled = !voice_processing_bypassed;
   engine_state_.voice_processing_agc_enabled = !voice_processing_bypassed;
+
+#if TARGET_OS_MACCATALYST
+  if (use_hal_) {
+    // Захват — HalCapture: постоянные 48 кГц моно в свой FineAudioBuffer, созданный один раз. Голосовой обработки Apple
+    // (VPIO) на этом пути нет: эхоподавление и шумоподавление — программные WebRTC (приложение и так выключает VPIO).
+    engine_state_ = SetVoiceProcessingPathEnabled(engine_state_, false);
+    engine_state_.platform_voice_processing_allowed = false;
+    audio_device_buffer_->SetRecordingSampleRate(HalCapture::kSampleRate);
+    audio_device_buffer_->SetRecordingChannels(1);
+    capture_fine_audio_buffer_.reset(new FineAudioBuffer(audio_device_buffer_.get()));
+    FineAudioBuffer* capture_buffer = capture_fine_audio_buffer_.get();
+    hal_capture_.reset(new HalCapture(
+        [capture_buffer](const int16_t* samples, size_t frames, int64_t capture_time_ns) {
+          capture_buffer->DeliverRecordedData(webrtc::ArrayView<const int16_t>(samples, frames),
+                                              kFixedRecordDelayEstimate, capture_time_ns);
+        },
+        [](const HalCaptureState& state) {
+          NSDictionary* info = HalCaptureStateDictionary(state);
+          dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:kAudioEngineInputStateNotification
+                                                                object:nil
+                                                              userInfo:info];
+          });
+        }));
+    LOGI() << "Capture: HAL input by explicit device (dada.mic.hal)";
+  }
+#endif
 }
 
 bool AudioEngineDevice::IsStopOnMuteModeEnabled() const {
@@ -1269,6 +1315,27 @@ int32_t AudioEngineDevice::PlayoutDelay(uint16_t* delayMS) const {
   return 0;
 }
 
+int32_t AudioEngineDevice::SetInputDeviceUID(std::optional<std::string> uid) {
+#if TARGET_OS_MACCATALYST
+  if (hal_capture_ == nullptr) return -1;
+  LOGI() << "SetInputDeviceUID: " << uid.value_or("default");
+  hal_capture_->SetDevice(std::move(uid));
+  return 0;
+#else
+  (void)uid;
+  return -1;
+#endif
+}
+
+NSDictionary* AudioEngineDevice::InputState() const {
+#if TARGET_OS_MACCATALYST
+  if (hal_capture_ == nullptr) return nil;
+  return HalCaptureStateDictionary(hal_capture_->State());
+#else
+  return nil;
+#endif
+}
+
 bool AudioEngineDevice::IsEngineRunning() {
   LOGI() << "IsEngineRunning";
   RTC_DCHECK_RUN_ON(thread_);
@@ -1582,6 +1649,8 @@ int32_t AudioEngineDevice::InitRecordingPersistentMode(bool* enabled) {
 AVAudioInputNode* AudioEngineDevice::InputNode(const EngineStateUpdate& state) {
   RTC_DCHECK_RUN_ON(thread_);
   RTC_DCHECK(engine_device_ != nil);
+  // Dada (#321): на пути HAL входной узел не создаётся никогда — он снова открыл бы системный вход через AUHAL.
+  RTC_DCHECK(!state.hal_input);
   RTC_DCHECK(state.prev.IsInputEnabled() || state.next.IsInputEnabled());
   input_node_instantiated_ = true;
   return engine_device_.inputNode;
@@ -1641,6 +1710,19 @@ void AudioEngineDevice::ReconfigureEngine() {
     // Re-configure is only for device mode
     if (current_state.render_mode != RenderMode::Device) return;
 
+    if (use_hal_) {
+      // Dada (#321): ввод живёт в HalCapture — пересоздаётся только вывод (смена вывода, переход гарнитуры Bluetooth в
+      // режим разговора); захват при этом не останавливается.
+      int32_t output_result = this->ModifyEngineState([](EngineState state) -> EngineState {
+        state.output_reconfigure_count += 1;
+        return state;
+      });
+      if (output_result != 0) {
+        LOGE() << "ReconfigureEngine: Failed to recreate output, error: " << output_result;
+      }
+      return;
+    }
+
     EngineState shutdown_state = this->engine_state_;
     shutdown_state.input_enabled = false;
     shutdown_state.input_running = false;
@@ -1683,7 +1765,12 @@ int32_t AudioEngineDevice::ModifyEngineState(
 
   EngineState old_state = engine_state_;
   EngineState new_state = state_transform(old_state);
-  EngineStateUpdate state = {old_state, new_state};
+  if (use_hal_) {
+    // Dada (#321): на пути HAL нет входа AVAudioEngine, а значит и VPIO — никакое изменение состояния его не включает.
+    new_state = SetVoiceProcessingPathEnabled(new_state, false);
+    new_state.platform_voice_processing_allowed = false;
+  }
+  EngineStateUpdate state = {old_state, new_state, use_hal_};
 
   // No changes, return immediately.
   if (state.HasNoChanges()) {
@@ -1788,6 +1875,8 @@ int32_t AudioEngineDevice::ModifyEngineState(
 int32_t AudioEngineDevice::ApplyManualEngineState(EngineStateUpdate state) {
   RTC_DCHECK_RUN_ON(thread_);
   RTC_DCHECK(engine_device_ == nullptr);
+  // Dada (#321): ручной рендер берёт ввод через сам движок, а не через захват HAL.
+  state.hal_input = false;
 
   std::vector<std::function<void()>> rollback_actions;
 
@@ -2169,6 +2258,17 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
                                   state.prev.IsInputEnabled() &&
                                   state.prev.voice_processing_enabled;
 
+#if TARGET_OS_MACCATALYST
+  // --------------------------------------------------------------------------------------------
+  // Step: Stop HAL capture (Dada #321) — до остановки буфера записи: после Stop() захват больше не пишет.
+  //
+  if (state.hal_input && hal_running_ && !HalShouldRun(state.next)) {
+    LOGI() << "Stopping HAL capture...";
+    hal_capture_->Stop();
+    hal_running_ = false;
+  }
+#endif
+
   std::vector<std::function<void()>> rollback_actions;
 
   auto rollback = [&](int32_t result) {
@@ -2183,7 +2283,8 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
   // --------------------------------------------------------------------------------------------
   // Step: Stop AVAudioEngine
   //
-  if (state.prev.IsAnyRunning() &&
+  // Dada (#321): только движок, который запускался (EngineRuns).
+  if (state.EngineRuns(state.prev) &&
       (!state.next.IsAnyRunning() || state.IsEngineRestartRequired() ||
        state.DidBeginInterruption() || state.IsEngineRecreateRequired())) {
     LOGI() << "Stopping AVAudioEngine...";
@@ -2226,10 +2327,12 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
   // --------------------------------------------------------------------------------------------
   // Step: Stop recording buffer
   //
-  if ((!state.next.IsInputEnabled() || state.IsEngineRecreateRequired()) &&
+  // Dada (#321): на пути HAL буфер записи не следует за пересозданием движка (оно только для вывода), его кормит HalCapture,
+  // уже остановленный выше, а движок вывода может идти дальше.
+  if ((!state.next.IsInputEnabled() || (state.IsEngineRecreateRequired() && !state.hal_input)) &&
       audio_device_buffer_->IsRecording()) {
     LOGI() << "Stopping Record buffer...";
-    if (engine_device_ != nullptr) {
+    if (engine_device_ != nullptr && !state.hal_input) {
       // Rendering must be stopped first.
       RTC_DCHECK(!engine_device_.running);
     }
@@ -2343,7 +2446,7 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
   // --------------------------------------------------------------------------------------------
   // Step: Configure Voice-Processing I/O
   //
-  if (state.next.IsInputEnabled() &&
+  if (!state.hal_input && state.next.IsInputEnabled() &&
       vp_was_configured != state.next.voice_processing_enabled) {
 #if TARGET_OS_SIMULATOR
     LOGI() << "setVoiceProcessingEnabled (input): "
@@ -2533,9 +2636,9 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
   }
 
   // --------------------------------------------------------------------------------------------
-  // Step: Enable input
+  // Step: Enable input (входной узел AVAudioEngine; на пути HAL у движка входа нет — Dada #321)
   //
-  if (state.next.IsInputEnabled() &&
+  if (!state.hal_input && state.next.IsInputEnabled() &&
       (!state.prev.IsInputEnabled() || state.IsEngineRecreateRequired())) {
     LOGI() << "Enabling input for AVAudioEngine...";
     RTC_DCHECK(!engine_device_.running);
@@ -2729,7 +2832,7 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
       return rollback(kAudioEngineDeviceFormatError);
     }
 
-  } else if ((state.prev.IsInputEnabled() && !state.next.IsInputEnabled()) &&
+  } else if (!state.hal_input && (state.prev.IsInputEnabled() && !state.next.IsInputEnabled()) &&
              !state.IsEngineRecreateRequired()) {
     LOGI() << "Disabling input for AVAudioEngine...";
     RTC_DCHECK(!engine_device_.running);
@@ -2819,6 +2922,14 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
       input_mixer_node_.outputVolume = mixer_volume;
     }
   }
+
+#if TARGET_OS_MACCATALYST
+  // Dada (#321): то же заглушение на пути HAL — нули вместо микрофона. Режим VoiceProcessing здесь не действует, как и при
+  // выключенном VPIO прежде.
+  if (state.hal_input) {
+    hal_capture_->SetMuted(state.next.mute_mode == MuteMode::InputMixer && state.next.input_muted);
+  }
+#endif
 
   // --------------------------------------------------------------------------------------------
   // Step: Configure other audio ducking
@@ -2939,14 +3050,18 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
   // Step: Start recording buffer
   //
   if (state.next.IsInputEnabled() && !audio_device_buffer_->IsRecording()) {
-    if (engine_device_ != nullptr) {
+    if (engine_device_ != nullptr && !state.hal_input) {
       // Rendering must be stopped first.
       RTC_DCHECK(!engine_device_.running);
     }
     LOGI() << "Starting Record buffer...";
     audio_device_buffer_->StartRecording();
-    EnsureFineAudioBuffer();
-    fine_audio_buffer_->ResetRecord();
+    if (state.hal_input) {
+      capture_fine_audio_buffer_->ResetRecord();
+    } else {
+      EnsureFineAudioBuffer();
+      fine_audio_buffer_->ResetRecord();
+    }
 
     rollback_actions.push_back([this]() {
       RTC_DCHECK_RUN_ON(thread_);
@@ -2960,7 +3075,10 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
   // --------------------------------------------------------------------------------------------
   // Step: Start engine
   //
-  if (state.next.IsAnyRunning()) {
+  // Dada (#321): на пути HAL у движка только вывод. Без вывода (output_available = NO) движок пуст и не стартует (EngineRuns) —
+  // AVFAudio бросает исключение, повторы держат поток WebRTC ~1 с, а откат не дал бы стартовать захвату HAL; захват идёт без
+  // движка.
+  if (state.EngineRuns(state.next)) {
     if (!state.prev.IsAnyRunning() || state.DidEndInterruption() ||
         state.IsEngineRestartRequired() || state.IsEngineRecreateRequired()) {
       if (observer_ != nullptr) {
@@ -3060,6 +3178,17 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
       }
     }
   }
+
+#if TARGET_OS_MACCATALYST
+  // --------------------------------------------------------------------------------------------
+  // Step: Start HAL capture (Dada #321) — после буфера записи; открытие устройства идёт на очереди HalCapture и не ждётся.
+  //
+  if (state.hal_input && !hal_running_ && HalShouldRun(state.next)) {
+    LOGI() << "Starting HAL capture...";
+    hal_capture_->Start();
+    hal_running_ = true;
+  }
+#endif
 
   // --------------------------------------------------------------------------------------------
   // Step: Release AVAudioEngine

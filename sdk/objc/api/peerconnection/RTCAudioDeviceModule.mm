@@ -29,6 +29,9 @@
 NSString *const RTC_CONSTANT_TYPE(RTCAudioEngineInputMixerNodeKey) =
     webrtc::kAudioEngineInputMixerNodeKey;
 
+NSString *const RTC_CONSTANT_TYPE(RTCAudioDeviceModuleInputStateNotification) =
+    webrtc::kAudioEngineInputStateNotification;
+
 inline webrtc::AudioEngineDevice::MuteMode MuteModeToRTC(RTC_OBJC_TYPE(RTCAudioEngineMuteMode)
                                                              mode) {
   return static_cast<webrtc::AudioEngineDevice::MuteMode>(mode);
@@ -306,6 +309,27 @@ class AudioDeviceObserver : public webrtc::AudioDeviceObserver {
 
     return NO;
   });
+}
+
+// Dada (#321): без перехода на рабочий поток — AudioEngineDevice::SetInputDeviceUID и InputState годятся для любого потока
+// и не ждут устройства (выбор микрофона из интерфейса не должен стоять за работой движка).
+- (BOOL)setInputDeviceUID:(nullable NSString *)uid {
+  webrtc::AudioEngineDevice *module =
+      AudioEngineDeviceOrNull(_native.get(), _audioDeviceModuleType);
+  if (module == nullptr) return NO;
+
+  std::optional<std::string> native_uid;
+  const char *utf8 = uid.UTF8String;
+  if (utf8 != nullptr && utf8[0] != '\0') native_uid = std::string(utf8);
+  return module->SetInputDeviceUID(native_uid) == 0;
+}
+
+- (nullable NSDictionary<NSString *, id> *)inputState {
+  webrtc::AudioEngineDevice *module =
+      AudioEngineDeviceOrNull(_native.get(), _audioDeviceModuleType);
+  if (module == nullptr) return nil;
+
+  return module->InputState();
 }
 
 - (BOOL)playing {

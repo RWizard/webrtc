@@ -125,6 +125,16 @@ RTC_OBJC_EXPORT
 
 RTC_EXTERN NSString *const RTC_CONSTANT_TYPE(RTCAudioEngineInputMixerNodeKey);
 
+// Dada (#321, Mac Catalyst): какой микрофон пишет и в каком формате — источник правды захвата HAL. Имя уведомления —
+// @"RTCAudioDeviceModuleInputStateNotification", приходит на главной очереди, object — nil. userInfo: uid, name, rate (Гц
+// устройства), ch, mode (default | explicit), requested (uid явного выбора, пока он держится; пусто — «по умолчанию»), target
+// (uid устройства, которое пишет или запишет старт по текущему режиму — только показываемое в списке приложения, capture_target.h;
+// актуален и пока захват стоит; пусто — писать не с чего), phase (idle | starting | running | switching | failed), seq,
+// switchMs, reason (first | voiced | ceiling | stalled), error (gone | not_found | no_device | no_frames | stalled | format | rate |
+// start:<код> | converter:<код>; её снимают успешная передача и остановка захвата), drops (число пропусков циклов ввода у пишущего микрофона с начала захвата),
+// handoffs (число передач права записи в этом захвате, включая первую: +1 на каждую; обнуляет старт, остановка сохраняет итог).
+RTC_EXTERN NSString *const RTC_CONSTANT_TYPE(RTCAudioDeviceModuleInputStateNotification);
+
 @class RTC_OBJC_TYPE(RTCAudioDeviceModule);
 @class RTC_OBJC_TYPE(RTCAudioProcessingOptions);
 
@@ -211,6 +221,14 @@ RTC_OBJC_EXPORT
 // successful.
 - (BOOL)trySetOutputDevice:(nullable RTC_OBJC_TYPE(RTCIODevice) *)device;
 - (BOOL)trySetInputDevice:(nullable RTC_OBJC_TYPE(RTCIODevice) *)device;
+
+// Dada (#321, Mac Catalyst): микрофон по UID устройства Core Audio, nil — идти за системным входом (как Chrome). Не ждёт:
+// новый микрофон открывается рядом со старым и получает запись без паузы, итог — в
+// RTCAudioDeviceModuleInputStateNotification. Системный вход не меняется. NO — захват HAL недоступен (не Catalyst или
+// NSUserDefaults dada.mic.hal = NO).
+- (BOOL)setInputDeviceUID:(nullable NSString *)uid;
+// Последнее состояние захвата HAL (ключи как в уведомлении); nil — недоступен. Любой поток, не ждёт.
+@property(nonatomic, readonly, nullable) NSDictionary<NSString *, id> *inputState;
 
 - (NSInteger)startPlayout;
 - (NSInteger)stopPlayout;

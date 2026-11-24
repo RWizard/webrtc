@@ -19,6 +19,8 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
+#include <string>
 
 #include "api/audio_options.h"
 #include "api/environment/environment.h"
@@ -26,6 +28,7 @@
 #include "api/sequence_checker.h"
 #include "api/task_queue/pending_task_safety_flag.h"
 #include "modules/audio_device/audio_device_generic.h"
+#include "modules/audio_device/hal_capture.h"
 #include "rtc_base/buffer.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/thread_annotations.h"
@@ -106,6 +109,8 @@ enum AudioEngineErrorCode {
 class FineAudioBuffer;
 
 extern NSString* const kAudioEngineInputMixerNodeKey;
+// Dada (#321): состояние захвата HAL на Mac Catalyst (HalCaptureStateDictionary), на главной очереди, object — nil.
+extern NSString* const kAudioEngineInputStateNotification;
 
 class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver {
  public:
@@ -169,6 +174,9 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
     uint32_t default_output_device_update_count = 0;  // Track default switch count
     uint32_t default_input_device_update_count = 0;
 
+    // Dada (#321): пересоздать только вывод (захват HAL на Catalyst живёт отдельно от AVAudioEngine).
+    uint32_t output_reconfigure_count = 0;
+
     bool operator==(const EngineState& rhs) const {
       return input_enabled == rhs.input_enabled && input_running == rhs.input_running &&
              output_enabled == rhs.output_enabled && output_running == rhs.output_running &&
@@ -183,7 +191,8 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
              advanced_ducking == rhs.advanced_ducking && ducking_level == rhs.ducking_level &&
              output_device_id == rhs.output_device_id && input_device_id == rhs.input_device_id &&
              default_output_device_update_count == rhs.default_output_device_update_count &&
-             default_input_device_update_count == rhs.default_input_device_update_count;
+             default_input_device_update_count == rhs.default_input_device_update_count &&
+             output_reconfigure_count == rhs.output_reconfigure_count;
     }
 
     bool operator!=(const EngineState& rhs) const { return !(*this == rhs); }
@@ -400,12 +409,20 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
 
   int32_t InitAndStartRecording(const AudioOptions *options = nullptr);
 
+  // Dada (#321, Mac Catalyst): микрофон по UID устройства Core Audio; nullopt или пусто — идти за системным входом. Любой
+  // поток, не ждёт: смена идёт без паузы, итог — в kAudioEngineInputStateNotification. -1 — захват HAL недоступен.
+  int32_t SetInputDeviceUID(std::optional<std::string> uid);
+  // Последнее состояние захвата HAL (ключи как в уведомлении); nil — недоступен. Любой поток.
+  NSDictionary* InputState() const;
+
   bool IsStopOnMuteModeEnabled() const override;
 
  private:
   struct EngineStateUpdate {
     EngineState prev;
     EngineState next;
+    // Dada (#321): захват идёт через HalCapture, AVAudioEngine только выводит — ввод не перезапускает и не пересоздаёт движок.
+    bool hal_input;
 
     bool HasNoChanges() const { return prev == next; }
 
@@ -426,6 +443,7 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
     bool DidEndInterruption() const { return prev.is_interrupted && !next.is_interrupted; }
 
     bool DidUpdateAudioGraph() const {
+      if (hal_input) return prev.IsOutputEnabled() != next.IsOutputEnabled();
       return (prev.IsInputEnabled() != next.IsInputEnabled()) ||
              (prev.IsOutputEnabled() != next.IsOutputEnabled());
     }
@@ -450,24 +468,35 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
 
     bool IsEngineRestartRequired() const { return DidUpdateAudioGraph(); }
 
+    // Dada (#321): идёт ли движок в этом состоянии. На пути HAL у движка только вывод: без вывода (output_available = NO) он
+    // пуст — не стартует и не останавливается, так что наблюдатель получает OnEngineWillStart и OnEngineDidStop только парой.
+    bool EngineRuns(const EngineState& state) const {
+      return state.IsAnyRunning() && (!hal_input || state.IsOutputEnabled());
+    }
+
     bool IsEngineRecreateRequired() const {
+      // Dada (#321): пересоздание только вывода (ReconfigureEngine на пути HAL) — когда вывод включён и до, и после. Счётчик,
+      // обнулённый сменой режима (Device ↔ Manual) или setEngineState:, — не пересоздание.
+      bool output = prev.IsOutputEnabled() && next.IsOutputEnabled() &&
+                    next.output_reconfigure_count > prev.output_reconfigure_count;
+
       // Device id specified
-      bool device = DidUpdateOutputDevice() || DidUpdateInputDevice();
+      bool device = DidUpdateOutputDevice() || (!hal_input && DidUpdateInputDevice());
 
       // Default device updated
       bool default_device = (DidUpdateDefaultOutputDevice() && next.IsOutputDefaultDevice()) ||
-                            (DidUpdateDefaultInputDevice() && next.IsInputDefaultDevice());
+                            (!hal_input && DidUpdateDefaultInputDevice() && next.IsInputDefaultDevice());
 
       // Special case to re-create engine when switching from Speaker & Mic ->
       // Speaker only.
-      bool special_case = (prev.IsOutputEnabled() && next.IsOutputEnabled()) &&
+      bool special_case = !hal_input && (prev.IsOutputEnabled() && next.IsOutputEnabled()) &&
                           (prev.IsInputEnabled() && !next.IsInputEnabled());
 
       // Toggling voice processing requires a full engine recreate to ensure
       // a clean audio hardware state.
-      bool voice_processing = DidUpdateVoiceProcessingEnabled();
+      bool voice_processing = !hal_input && DidUpdateVoiceProcessingEnabled();
 
-      return device || default_device || special_case || voice_processing;
+      return output || device || default_device || special_case || voice_processing;
     }
 
     bool DidEnableManualRenderingMode() const {
@@ -549,6 +578,16 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
   const std::unique_ptr<TaskQueueFactory> task_queue_factory_;
   std::unique_ptr<AudioDeviceBuffer> audio_device_buffer_;
   std::unique_ptr<FineAudioBuffer> fine_audio_buffer_;
+
+  // Dada (#321): на Mac Catalyst захват — HalCapture (свой поток HAL по явному устройству, постоянные 48 кГц моно, свой
+  // FineAudioBuffer, созданный один раз); AVAudioEngine только выводит. Выключатель — NSUserDefaults dada.mic.hal = NO.
+  const bool use_hal_;
+  std::unique_ptr<FineAudioBuffer> capture_fine_audio_buffer_;
+#if TARGET_OS_MACCATALYST
+  // После буферов: разрушается первым и до них перестаёт писать.
+  std::unique_ptr<HalCapture> hal_capture_;
+  bool hal_running_ RTC_GUARDED_BY(thread_) = false;
+#endif
 
   AudioParameters playout_parameters_;
   AudioParameters record_parameters_;

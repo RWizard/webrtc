@@ -378,6 +378,18 @@ rtc_library("audio_device_impl") {
         deps += [
           "../../sdk:audio_session_objc",
         ]
+
+        # Dada #321: HAL capture by explicit device on Mac Catalyst (code under TARGET_OS_MACCATALYST).
+        sources += [
+          "capture_handoff.h",
+          "capture_target.h",
+          "hal_capture.h",
+          "hal_capture.mm",
+        ]
+        frameworks = [
+          "AudioToolbox.framework",
+          "CoreAudio.framework",
+        ]
       }
       if (is_mac) {
         sources += [
